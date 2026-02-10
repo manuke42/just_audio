@@ -3627,11 +3627,13 @@ class LockCachingAudioSource extends StreamAudioSource {
           cacheResponse.controller.close();
         }
       }
+      await sink.close();
       (await _partialCacheFile).renameSync(cacheFile.path);
       await subscription.cancel();
       httpClient.close();
       _downloading = false;
     }, onError: (Object e, StackTrace stackTrace) async {
+      await sink.close();
       (await _partialCacheFile).deleteSync();
       httpClient.close();
       // Fail all pending requests
