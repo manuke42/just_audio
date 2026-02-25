@@ -3678,15 +3678,27 @@ class LockCachingAudioSource extends StreamAudioSource {
       return Future<HttpClientResponse>.error(error as Object, stackTrace);
     });
     return byteRangeRequest.future.then((response) {
-      response.stream.listen((event) {}, onError: (Object e, StackTrace st) {
-        // So that we can restart later
-        _response = null;
-        // Cancel any pending request
-        for (final req in _requests) {
-          req.fail(e, st);
-        }
-      });
-      return response;
+      final stream = response.stream.transform(
+        StreamTransformer<List<int>, List<int>>.fromHandlers(
+          handleError: (Object e, StackTrace st, EventSink<List<int>> sink) {
+            // So that we can restart later.
+            _response = null;
+            // Cancel any pending request.
+            for (final req in _requests) {
+              req.fail(e, st);
+            }
+            sink.addError(e, st);
+          },
+        ),
+      );
+      return StreamAudioResponse(
+        rangeRequestsSupported: response.rangeRequestsSupported,
+        sourceLength: response.sourceLength,
+        contentLength: response.contentLength,
+        offset: response.offset,
+        contentType: response.contentType,
+        stream: stream,
+      );
     });
   }
 }
