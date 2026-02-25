@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:math';
 
@@ -3494,6 +3495,12 @@ class LockCachingAudioSource extends StreamAudioSource {
     final acceptRanges = response.headers.value(HttpHeaders.acceptRangesHeader);
     final originSupportsRangeRequests =
         acceptRanges != null && acceptRanges != 'none';
+    developer.log(
+      'LockCachingAudioSource._fetch: '
+      'uri=$uri, mimeType=$mimeType, sourceLength=$sourceLength, '
+      'acceptRanges=$acceptRanges, rangeSupport=$originSupportsRangeRequests',
+      name: 'just_audio',
+    );
     final mimeFile = await _mimeFile;
     await mimeFile.writeAsString(mimeType);
     final inProgressResponses = <_InProgressCacheResponse>[];
@@ -3563,9 +3570,20 @@ class LockCachingAudioSource extends StreamAudioSource {
         final effectiveEnd = end ?? sourceLength;
         Stream<List<int>> responseStream;
         if (effectiveEnd != null && effectiveEnd <= _progress) {
+          developer.log(
+            '_fetch: readyRequest start=$start end=$end '
+            'serving entirely from cache (progress=$_progress)',
+            name: 'just_audio',
+          );
           responseStream =
               getEffectiveCacheFile().openRead(effectiveStart, effectiveEnd);
         } else {
+          developer.log(
+            '_fetch: readyRequest start=$start end=$end '
+            'serving cache(0..$_progress) + live stream '
+            '(effectiveEnd=$effectiveEnd, sourceLength=$sourceLength)',
+            name: 'just_audio',
+          );
           final cacheResponse = _InProgressCacheResponse(end: effectiveEnd);
           inProgressResponses.add(cacheResponse);
           responseStream = Rx.concatEager([
@@ -3583,7 +3601,7 @@ class LockCachingAudioSource extends StreamAudioSource {
               effectiveEnd != null ? effectiveEnd - effectiveStart : null,
           offset: start,
           contentType: mimeType,
-          stream: responseStream.asBroadcastStream(),
+          stream: responseStream,
         ));
       }
       subscription.resume();
@@ -3610,7 +3628,7 @@ class LockCachingAudioSource extends StreamAudioSource {
             contentLength: end != null ? end - start : null,
             offset: start,
             contentType: mimeType,
-            stream: response.asBroadcastStream(),
+            stream: response,
           ));
         }, onError: (dynamic e, StackTrace? stackTrace) {
           request.fail(e, stackTrace);
@@ -3619,6 +3637,12 @@ class LockCachingAudioSource extends StreamAudioSource {
         });
       }
     }, onDone: () async {
+      developer.log(
+        '_fetch: download DONE, progress=$_progress, sourceLength=$sourceLength, '
+        'inProgressResponses=${inProgressResponses.length}, '
+        'pendingRequests=${_requests.length}',
+        name: 'just_audio',
+      );
       if (sourceLength == null) {
         updateProgress(100);
       }
@@ -3656,15 +3680,25 @@ class LockCachingAudioSource extends StreamAudioSource {
     final cacheFile = await this.cacheFile;
     if (cacheFile.existsSync()) {
       final sourceLength = cacheFile.lengthSync();
+      developer.log(
+        'LockCachingAudioSource.request: serving from CACHE '
+        'start=$start, end=$end, sourceLength=$sourceLength',
+        name: 'just_audio',
+      );
       return StreamAudioResponse(
         rangeRequestsSupported: true,
         sourceLength: start != null ? sourceLength : null,
         contentLength: (end ?? sourceLength) - (start ?? 0),
         offset: start,
         contentType: await _readCachedMimeType(),
-        stream: cacheFile.openRead(start, end).asBroadcastStream(),
+        stream: cacheFile.openRead(start, end),
       );
     }
+    developer.log(
+      'LockCachingAudioSource.request: serving LIVE '
+      'start=$start, end=$end, downloading=$_downloading, progress=$_progress',
+      name: 'just_audio',
+    );
     final byteRangeRequest = _StreamingByteRangeRequest(start, end);
     _requests.add(byteRangeRequest);
     _response ??=
@@ -3766,6 +3800,12 @@ _ProxyHandler _proxyHandlerForSource(StreamAudioSource source) {
     final rangeRequest =
         _HttpRangeRequest.parse(request.headers[HttpHeaders.rangeHeader]);
 
+    developer.log(
+      'Proxy: incoming ${request.method} ${request.uri} '
+      'range=${request.headers[HttpHeaders.rangeHeader]}',
+      name: 'just_audio',
+    );
+
     request.response.headers.clear();
 
     StreamAudioResponse sourceResponse;
@@ -3775,8 +3815,12 @@ _ProxyHandler _proxyHandlerForSource(StreamAudioSource source) {
           await source.request(rangeRequest?.start, rangeRequest?.endEx);
       stream = sourceResponse.stream;
     } catch (e, st) {
-      // ignore: avoid_print
-      print("Proxy request failed: $e\n$st");
+      developer.log(
+        'Proxy: request FAILED: $e',
+        name: 'just_audio',
+        error: e,
+        stackTrace: st,
+      );
 
       request.response.headers.clear();
       request.response.statusCode = HttpStatus.internalServerError;
@@ -3800,16 +3844,53 @@ _ProxyHandler _proxyHandlerForSource(StreamAudioSource source) {
       request.response.headers
           .set(HttpHeaders.contentRangeHeader, range.header);
       request.response.statusCode = 206;
+      developer.log(
+        'Proxy: responding 206 content-type=${sourceResponse.contentType} '
+        'content-length=${range.length} range=${range.header}',
+        name: 'just_audio',
+      );
     } else {
       request.response.contentLength = sourceResponse.contentLength ?? -1;
       request.response.statusCode = 200;
+      developer.log(
+        'Proxy: responding 200 content-type=${sourceResponse.contentType} '
+        'content-length=${sourceResponse.contentLength ?? -1} '
+        'rangeSupported=${sourceResponse.rangeRequestsSupported}',
+        name: 'just_audio',
+      );
     }
 
+    var bytesServed = 0;
     final completer = Completer<void>();
-    final subscription = stream.listen(request.response.add,
-        onError: (e, st) {}, onDone: completer.complete);
+    final subscription = stream.listen(
+      (data) {
+        bytesServed += data.length;
+        request.response.add(data);
+      },
+      onError: (e, st) {
+        developer.log(
+          'Proxy: stream error after $bytesServed bytes: $e',
+          name: 'just_audio',
+          error: e,
+          stackTrace: st,
+        );
+      },
+      onDone: () {
+        developer.log(
+          'Proxy: stream done, served $bytesServed bytes',
+          name: 'just_audio',
+        );
+        completer.complete();
+      },
+    );
 
     request.response.done.then((dynamic value) {
+      if (!completer.isCompleted) {
+        developer.log(
+          'Proxy: client disconnected after $bytesServed bytes',
+          name: 'just_audio',
+        );
+      }
       subscription.cancel();
     });
 
