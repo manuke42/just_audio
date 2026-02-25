@@ -3523,15 +3523,17 @@ class LockCachingAudioSource extends StreamAudioSource {
               : (100 * _progress ~/ sourceLength);
       updateProgress(newPercentProgress);
       sink.add(data);
+      // Categorize requests by whether the requested data is already
+      // available in our local cache, regardless of whether the origin
+      // server supports range requests. The proxy can always serve ranges
+      // from its local cache.
       final readyRequests = _requests
           .where((request) =>
-              !originSupportsRangeRequests ||
               request.start == null ||
               (request.start!) < _progress)
           .toList();
       final notReadyRequests = _requests
           .where((request) =>
-              originSupportsRangeRequests &&
               request.start != null &&
               (request.start!) >= _progress)
           .toList();
@@ -3555,17 +3557,12 @@ class LockCachingAudioSource extends StreamAudioSource {
       subscription.pause();
       await sink.flush();
       // Process any requests that start within the cache.
+      // Always respect the requested byte range — the proxy serves from
+      // local cache and can handle ranges even when the origin cannot.
       for (var request in readyRequests) {
         _requests.remove(request);
-        int? start, end;
-        if (originSupportsRangeRequests) {
-          start = request.start;
-          end = request.end;
-        } else {
-          // If the origin doesn't support range requests, the proxy should also
-          // ignore range requests and instead serve a complete 200 response
-          // which the client (AV or exo player) should know how to deal with.
-        }
+        final start = request.start;
+        final end = request.end;
         final effectiveStart = start ?? 0;
         final effectiveEnd = end ?? sourceLength;
         Stream<List<int>> responseStream;
@@ -3595,7 +3592,7 @@ class LockCachingAudioSource extends StreamAudioSource {
           ]);
         }
         request.complete(StreamAudioResponse(
-          rangeRequestsSupported: originSupportsRangeRequests,
+          rangeRequestsSupported: true,
           sourceLength: start != null ? sourceLength : null,
           contentLength:
               effectiveEnd != null ? effectiveEnd - effectiveStart : null,
@@ -3607,34 +3604,45 @@ class LockCachingAudioSource extends StreamAudioSource {
       subscription.resume();
       // Process any requests that start beyond the cache.
       for (var request in notReadyRequests) {
-        _requests.remove(request);
-        final start = request.start!;
-        final end = request.end ?? sourceLength;
-        final httpClient = _createHttpClient(userAgent: _player?._userAgent);
+        if (originSupportsRangeRequests) {
+          // Origin supports ranges — make a separate HTTP range request.
+          _requests.remove(request);
+          final start = request.start!;
+          final end = request.end ?? sourceLength;
+          final httpClient = _createHttpClient(userAgent: _player?._userAgent);
 
-        final rangeRequest = _HttpRangeRequest(start, end);
-        _getUrl(httpClient, uri, headers: {
-          if (headers != null) ...headers!,
-          HttpHeaders.rangeHeader: rangeRequest.header,
-        }).then((httpRequest) async {
-          final response = await httpRequest.close();
-          if (response.statusCode != 206) {
-            httpClient.close();
-            throw Exception('HTTP Status Error: ${response.statusCode}');
-          }
-          request.complete(StreamAudioResponse(
-            rangeRequestsSupported: originSupportsRangeRequests,
-            sourceLength: sourceLength,
-            contentLength: end != null ? end - start : null,
-            offset: start,
-            contentType: mimeType,
-            stream: response,
-          ));
-        }, onError: (dynamic e, StackTrace? stackTrace) {
-          request.fail(e, stackTrace);
-        }).onError((Object e, StackTrace st) {
-          request.fail(e, st);
-        });
+          final rangeRequest = _HttpRangeRequest(start, end);
+          _getUrl(httpClient, uri, headers: {
+            if (headers != null) ...headers!,
+            HttpHeaders.rangeHeader: rangeRequest.header,
+          }).then((httpRequest) async {
+            final response = await httpRequest.close();
+            if (response.statusCode != 206) {
+              httpClient.close();
+              throw Exception('HTTP Status Error: ${response.statusCode}');
+            }
+            request.complete(StreamAudioResponse(
+              rangeRequestsSupported: true,
+              sourceLength: sourceLength,
+              contentLength: end != null ? end - start : null,
+              offset: start,
+              contentType: mimeType,
+              stream: response,
+            ));
+          }, onError: (dynamic e, StackTrace? stackTrace) {
+            request.fail(e, stackTrace);
+          }).onError((Object e, StackTrace st) {
+            request.fail(e, st);
+          });
+        } else {
+          // Origin doesn't support ranges — keep request queued.
+          // It will be fulfilled once enough data has been downloaded.
+          developer.log(
+            '_fetch: notReadyRequest start=${request.start} end=${request.end} '
+            'kept queued (origin has no range support, progress=$_progress)',
+            name: 'just_audio',
+          );
+        }
       }
     }, onDone: () async {
       developer.log(
@@ -3653,6 +3661,28 @@ class LockCachingAudioSource extends StreamAudioSource {
       }
       await sink.close();
       (await _partialCacheFile).renameSync(cacheFile.path);
+      // Fulfill any requests still queued (e.g. range requests that
+      // were waiting for data the origin couldn't serve via ranges).
+      final remainingRequests =
+          List<_StreamingByteRangeRequest>.from(_requests);
+      _requests.clear();
+      for (var request in remainingRequests) {
+        final start = request.start ?? 0;
+        final end = request.end ?? _progress;
+        developer.log(
+          '_fetch onDone: fulfilling remaining request '
+          'start=${request.start} end=${request.end} from cache',
+          name: 'just_audio',
+        );
+        request.complete(StreamAudioResponse(
+          rangeRequestsSupported: true,
+          sourceLength: request.start != null ? _progress : null,
+          contentLength: end - start,
+          offset: request.start,
+          contentType: mimeType,
+          stream: cacheFile.openRead(start, end),
+        ));
+      }
       await subscription.cancel();
       httpClient.close();
       _downloading = false;
