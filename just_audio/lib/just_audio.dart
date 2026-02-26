@@ -1018,6 +1018,7 @@ class AudioPlayer {
           ))
           .then((response) => response.duration);
       final duration = await _loadFuture;
+      developer.log('Load completed and duration is $duration', name: 'just_audio');
       checkInterruption();
       if (platform != _platformValue) {
         // the platform has changed since we started loading, so abort.

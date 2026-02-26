@@ -936,7 +936,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         if (processingState == ProcessingState.idle || processingState == ProcessingState.loading || player == null) {
             return C.TIME_UNSET;
         } else {
-            return player.getDuration();
+            // return player.getDuration();
+            var duration = player.getDuration();
+            developer.log("getDuration() returns " + duration, name: "just_audio");
+            return duration;
         }
     }
 
