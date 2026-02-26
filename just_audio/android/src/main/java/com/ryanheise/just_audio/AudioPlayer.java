@@ -938,11 +938,11 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         } else {
             // return player.getDuration();
             var duration = player.getDuration();
-            developer.log("getDuration() returns " + duration, name: "just_audio");
+            Log.d(TAG, "[just_audio AudioPlayer] getDuration: " + duration);
             return duration;
         }
     }
-
+        
     private void sendError(int errorCode, String errorMsg, Object details) {
         sendError(errorCode, errorMsg, details, true);
     }
